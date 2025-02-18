@@ -1,0 +1,12 @@
+# Binaries
+/bin/
+/build/
+
+# Environment variables
+.env
+
+# Dependency directories
+/vendor/
+
+# Logs
+/log/
