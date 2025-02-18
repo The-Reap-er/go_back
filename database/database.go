@@ -13,9 +13,12 @@ import (
 )
 
 var (
-	Client         *mongo.Client
-	UserCollection *mongo.Collection
-	URLCollection  *mongo.Collection
+	Client              *mongo.Client
+	UserCollection      *mongo.Collection
+	URLCollection       *mongo.Collection
+	ScanLogCollection   *mongo.Collection // Collection for scan logs
+	APITargetCollection *mongo.Collection // Collection for API targets
+	APIAlertCollection  *mongo.Collection // Collection for API alerts
 )
 
 func ConnectDB(cfg config.Config) {
@@ -39,8 +42,11 @@ func ConnectDB(cfg config.Config) {
 
 	UserCollection = db.Collection("users")
 	URLCollection = db.Collection("urls")
+	ScanLogCollection = db.Collection("scan_logs")
+	APITargetCollection = db.Collection("api_targets")
+	APIAlertCollection = db.Collection("api_alerts") // Initialize the new collection
+
 	// Create indexes if necessary
-	// Example: Unique index on username
 	_, err = UserCollection.Indexes().CreateOne(ctx, mongo.IndexModel{
 		Keys:    bson.M{"username": 1},
 		Options: options.Index().SetUnique(true),
