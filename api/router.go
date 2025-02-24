@@ -36,6 +36,7 @@ func SetupRouter(cfg config.Config) *gin.Engine {
 		protected.POST("/api/v1/url-scan/service/:service", controllers.StartActiveScan)
 		protected.GET("/api/v1/url-report/service/:service", controllers.GetAlerts)
 		protected.GET("/api/v1/check/service/:service", controllers.CheckUrl)
+		protected.GET("/api/v1/check/api/service/:service", controllers.CheckApi)
 		protected.POST("/api/v1/import-api/service/:service", controllers.ImportApiTarget)
 		protected.POST("/api/v1/api-scan/service/:service", controllers.StartApiScan)
 		protected.GET("/api/v1/api-report/service/:service", controllers.GetApiAlerts)

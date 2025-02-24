@@ -7,11 +7,15 @@ import (
 	"go_back/database"
 	"go_back/models"
 	"io"
+	"log"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
 	"fmt"
+
+	"github.com/google/uuid"
 
 	"github.com/gin-gonic/gin"
 	"go.mongodb.org/mongo-driver/bson"
@@ -370,6 +374,112 @@ func StartActiveScan(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": "Active scan initiated", "results": scanResults})
 }
 
+func CheckApi(c *gin.Context) {
+	serviceName := c.Param("service")
+	if serviceName == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Service name is required"})
+		return
+	}
+
+	userIDStr, exists := c.Get("user_id")
+	if !exists {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "User ID not found in context"})
+		return
+	}
+	userID, ok := userIDStr.(primitive.ObjectID)
+	if !ok {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "User ID has invalid type"})
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// Retrieve API targets from database
+	cursor, err := database.APITargetCollection.Find(ctx, bson.M{
+		"user_id": userID,
+		"service": serviceName,
+	})
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to retrieve API targets"})
+		return
+	}
+	defer cursor.Close(ctx)
+
+	var apiTargets []models.APITarget
+	if err = cursor.All(ctx, &apiTargets); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to parse API targets"})
+		return
+	}
+
+	// Extract base URLs from API schemas
+	var baseURLs []string
+	for _, target := range apiTargets {
+		u, err := url.Parse(target.APISchema)
+		if err != nil {
+			log.Printf("Failed to parse API schema URL: %s", target.APISchema)
+			continue
+		}
+
+		// Rebuild base URL (scheme + host)
+		if u.Scheme != "" && u.Host != "" {
+			baseURL := fmt.Sprintf("%s://%s", u.Scheme, u.Host)
+			if !contains(baseURLs, baseURL) {
+				baseURLs = append(baseURLs, baseURL)
+			}
+		}
+	}
+
+	if len(baseURLs) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "No valid base URLs found for this service"})
+		return
+	}
+
+	// Prepare sites parameter for report
+	sitesParam := strings.Join(baseURLs, ",")
+	encodedSites := url.QueryEscape(sitesParam)
+
+	// Load ZAP configuration
+	cfg := config.LoadConfig()
+	reportID := uuid.New().String()
+
+	// Generate ZAP report with base URLs
+	reportURL := fmt.Sprintf("%s/JSON/reports/action/generate/?apikey=%s&title=%s&template=modern&reportFileName=%s&sites=%s",
+		cfg.ZAPAPIURL,
+		cfg.ZAPAPIKey,
+		url.QueryEscape(serviceName),
+		reportID,
+		encodedSites)
+
+	_, err = http.Get(reportURL)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error":   "Failed to generate security report",
+			"details": err.Error(),
+		})
+		return
+	}
+
+	// Prepare response
+	response := gin.H{
+		"report_url": fmt.Sprintf("http://localhost:9002/%s.html", reportID),
+		"base_urls":  baseURLs,
+		"service":    serviceName,
+	}
+
+	c.JSON(http.StatusOK, response)
+}
+
+// Helper function to check for existing URLs
+func contains(slice []string, item string) bool {
+	for _, s := range slice {
+		if s == item {
+			return true
+		}
+	}
+	return false
+}
+
 func CheckUrl(c *gin.Context) {
 	serviceName := c.Param("service")
 	if serviceName == "" {
@@ -391,6 +501,7 @@ func CheckUrl(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
+	// Retrieve URLs from database
 	cursor, err := database.URLCollection.Find(ctx, bson.M{"user_id": userID, "service": serviceName})
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to retrieve URLs"})
@@ -404,73 +515,55 @@ func CheckUrl(c *gin.Context) {
 		return
 	}
 
-	// Load ZAP configuration
-	cfg := config.LoadConfig()
-
-	// Initialize counts for each risk level
-	alertCounts := map[string]int{
-		"Medium":   0,
-		"High":     0,
-		"Critical": 0,
-	}
-
-	// Iterate over each URL and send a request to ZAP for alerts
+	// Collect all URLs from database entries
+	var siteURLs []string
 	for _, url := range urls {
-		individualURLs := strings.Split(url.URLList, ",")
-		for _, targetURL := range individualURLs {
-			targetURL = strings.TrimSpace(targetURL)
-			zapAPIURL := fmt.Sprintf("%s/JSON/alert/view/alerts/?baseurl=%s&apikey=%s", cfg.ZAPAPIURL, targetURL, cfg.ZAPAPIKey)
-
-			resp, err := http.Get(zapAPIURL)
-			if err != nil {
-				logScanDetails(userID, targetURL, "alert", "failure", err.Error())
-				continue
+		urlsFromEntry := strings.Split(url.URLList, ",")
+		for _, u := range urlsFromEntry {
+			trimmedURL := strings.TrimSpace(u)
+			if trimmedURL != "" {
+				siteURLs = append(siteURLs, trimmedURL)
 			}
-			defer resp.Body.Close()
-
-			body, err := io.ReadAll(resp.Body)
-			if err != nil {
-				logScanDetails(userID, targetURL, "alert", "failure", err.Error())
-				continue
-			}
-
-			if resp.StatusCode != http.StatusOK {
-				logScanDetails(userID, targetURL, "alert", "failure", fmt.Sprintf("ZAP returned an error: %s", string(body)))
-				continue
-			}
-
-			// Parse the JSON response
-			var zapResponse struct {
-				Alerts []struct {
-					Risk string `json:"risk"`
-				} `json:"alerts"`
-			}
-			if err := json.Unmarshal(body, &zapResponse); err != nil {
-				logScanDetails(userID, targetURL, "alert", "failure", "Failed to parse JSON response")
-				continue
-			}
-
-			// Count the alerts by risk level
-			for _, alert := range zapResponse.Alerts {
-				alertCounts[alert.Risk]++
-			}
-
-			logScanDetails(userID, targetURL, "alert", "success", string(body))
 		}
 	}
 
-	// Check if the project passes or fails security
-	if alertCounts["Medium"] > 0 || alertCounts["High"] > 0 || alertCounts["Critical"] > 0 {
-		c.JSON(http.StatusOK, gin.H{
-			"message": "Your project failed the security check.",
-			"counts":  alertCounts,
-		})
-	} else {
-		c.JSON(http.StatusOK, gin.H{
-			"message": "Your project is safe. Proceed.",
-			"counts":  alertCounts,
-		})
+	if len(siteURLs) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "No valid URLs found for this service"})
+		return
 	}
+
+	// Prepare sites parameter for report
+	sitesParam := strings.Join(siteURLs, ",")
+	encodedSites := url.QueryEscape(sitesParam)
+
+	// Load ZAP configuration
+	cfg := config.LoadConfig()
+	reportID := uuid.New().String()
+
+	// Generate ZAP report with dynamic URLs
+	reportURL := fmt.Sprintf("%s/JSON/reports/action/generate/?apikey=%s&title=%s&template=modern&reportFileName=%s&sites=%s",
+		cfg.ZAPAPIURL,
+		cfg.ZAPAPIKey,
+		url.QueryEscape(serviceName),
+		reportID,
+		encodedSites)
+
+	_, err = http.Get(reportURL)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error":   "Failed to generate security report",
+			"details": err.Error(),
+		})
+		return
+	}
+
+	// Prepare response
+	response := gin.H{
+		"report_url":   fmt.Sprintf("http://localhost:9002/%s.html", reportID),
+		"scanned_urls": siteURLs,
+	}
+
+	c.JSON(http.StatusOK, response)
 }
 
 func GetAlerts(c *gin.Context) {
